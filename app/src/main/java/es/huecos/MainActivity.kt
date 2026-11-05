@@ -12,7 +12,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(TextView(this).apply {
             text = "Huecos"
-            textColor = Color.BLUE
+            setTextColor(Color.BLUE)
             textSize = 32f
             gravity = Gravity.CENTER
         })
