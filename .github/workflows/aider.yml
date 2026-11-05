@@ -16,8 +16,8 @@ name: Aider (agente de reserva)
 # PALABRA CLAVE: un Issue nuevo del dueño cuyo título (o texto) empieza por "Agente"
 # también arranca solo, con nivel automático (sirve desde la app de GitHub).
 #
-# COMPILACIÓN (solo encargos normales o difíciles): Aider compila la app tras cada
-# cambio; si no compila, ve el error y lo corrige solo. En los fáciles va directo.
+# COMPILACIÓN: Aider compila la app tras cada cambio; si no compila, ve el error y
+# lo corrige solo. El comentario dice si al final compila.
 #
 # CHAT: si el dueño comenta en el Issue o en el Pull Request del agente, Aider
 # contesta (si termina en "?" o empieza por "pregunta": solo responde, no toca
@@ -195,14 +195,11 @@ jobs:
           python-version: "3.12"
 
       # Java y Gradle (los mismos que compilar.yml) para que Aider pueda compilar.
-      # Solo en encargos normales o difíciles: en los fáciles se ahorra ~1 minuto.
       - uses: actions/setup-java@v4
-        if: env.ETIQUETA != 'aider'
         with:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
-        if: env.ETIQUETA != 'aider'
         with:
           gradle-version: "8.9"
 
@@ -426,14 +423,14 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # Java y Gradle (los mismos que compilar.yml) para que Aider pueda compilar.
-      # Solo para órdenes normales o difíciles: en las fáciles y en preguntas no hace falta.
+      # En las preguntas no hace falta (no se cambia código).
       - uses: actions/setup-java@v4
-        if: steps.loc.outputs.saltar != 'si' && env.ETIQUETA != 'aider'
+        if: steps.loc.outputs.saltar != 'si' && env.TIPO != 'pregunta'
         with:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
-        if: steps.loc.outputs.saltar != 'si' && env.ETIQUETA != 'aider'
+        if: steps.loc.outputs.saltar != 'si' && env.TIPO != 'pregunta'
         with:
           gradle-version: "8.9"
 

@@ -36,13 +36,13 @@ LEER=()
 [ -f CLAUDE.md ] && LEER=(--read CLAUDE.md)
 
 # Compilar tras cada cambio (función de serie de Aider: --auto-test). Si no compila,
-# Aider ve el error y lo corrige solo. Solo en encargos normales o difíciles (en los
-# fáciles nunca ha hecho falta y solo hace esperar ~1 minuto) y nunca en preguntas.
+# Aider ve el error y lo corrige solo. En todos los encargos y órdenes (una prueba
+# real demostró que también los fáciles pueden romper la app); nunca en preguntas.
 COMPILAR="gradle compileDebugKotlin --no-daemon -q"
 PRUEBA=()
 rm -f /tmp/compila.md
 COMPILA_AQUI=no
-if [ "$ASK" != 1 ] && [ "$ETIQUETA" != aider ] && command -v gradle > /dev/null; then
+if [ "$ASK" != 1 ] && command -v gradle > /dev/null; then
   COMPILA_AQUI=si
   PRUEBA=(--test-cmd "$COMPILAR" --auto-test)
 fi

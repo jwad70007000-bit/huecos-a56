@@ -21,8 +21,8 @@ desde el móvil. Estas reglas valen para cualquier agente (Claude, Aider…).
 - El trabajo de cada día lo hace **Aider** con OpenRouter (más barato): el
   dueño lo llama con el formulario "Nuevo encargo", con un Issue cuyo título
   empieza por "Agente", o comentando en el Issue o en el Pull Request.
-- En encargos normales o difíciles, Aider compila la app tras cada cambio y,
-  si no compila, corrige el error solo. En los fáciles va directo (más rápido). Compilar no garantiza que funcione: hay que probar
+- Tras cada cambio, Aider compila la app y, si no compila, corrige el error
+  solo. Compilar no garantiza que funcione: hay que probar
   la APK en el móvil.
 
 ## Cómo debe responder el agente cuando el dueño le escribe
