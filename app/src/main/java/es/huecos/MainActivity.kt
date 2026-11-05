@@ -1,6 +1,7 @@
 package es.huecos
 
 import android.app.Activity
+import android.graphics.Color
 import android.os.Bundle
 import android.view.Gravity
 import android.widget.TextView
@@ -11,6 +12,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(TextView(this).apply {
             text = "Huecos"
+            textColor = Color.BLUE
             textSize = 32f
             gravity = Gravity.CENTER
         })
