@@ -1,0 +1,44 @@
+name: Nuevo encargo (por voz)
+description: Dicta lo que quieres con el micrófono del teclado. El agente arranca solo al enviarlo.
+title: "Encargo por voz"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Pulsa el micrófono de tu teclado y habla. No hace falta escribir nada más:
+        al enviar, el agente empieza solo y te avisa aquí con un enlace.
+  - type: textarea
+    id: que-quiero
+    attributes:
+      label: Qué quiero
+      description: Cuéntalo con tus palabras, como si se lo dijeras a una persona.
+      placeholder: "Quiero que el botón Parar sea rojo y más grande."
+    validations:
+      required: true
+  - type: textarea
+    id: como-sabre
+    attributes:
+      label: Cómo sabré que funciona
+      description: Qué tendría que ver o pasar en la app para que digas "perfecto".
+    validations:
+      required: false
+  - type: textarea
+    id: no-tocar
+    attributes:
+      label: Qué NO hay que tocar
+      description: Cosas que deben quedarse exactamente como están.
+    validations:
+      required: false
+  - type: dropdown
+    id: dificultad
+    attributes:
+      label: Dificultad
+      description: Déjalo en Automática y el agente decide solo. Las otras opciones sirven para forzarlo (cuanto más difícil, mejor modelo y más cuesta).
+      options:
+        - Automática (el agente elige)
+        - Fácil (modelo barato)
+        - Normal (aider-pro)
+        - Difícil (aider-max)
+      default: 0
+    validations:
+      required: true

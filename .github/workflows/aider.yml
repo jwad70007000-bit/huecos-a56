@@ -1,0 +1,528 @@
+name: Aider (agente de reserva)
+
+# Se activa cuando el dueño del repo pone una de estas etiquetas a un Issue
+# (también al crear el Issue ya con la etiqueta):
+#   aider      -> un solo modelo barato (el de siempre)
+#   aider-pro  -> arquitecto: piensa DeepSeek Pro, escribe el barato
+#   aider-max  -> arquitecto: piensa Kimi (o el GLM más reciente), escribe el barato
+#   aider-reintento -> como aider-max, para repetir un encargo que salió mal
+#                      (lee también tus comentarios nuevos del Issue)
+# Además arranca SOLO al crear un Issue con el formulario "Nuevo encargo": la
+# etiqueta se elige según la "Dificultad". Con "Automática" (lo normal) un modelo
+# barato hace un triaje y decide el nivel; Fácil/Normal/Difícil lo fuerzan.
+# Los cambios hechos con GITHUB_TOKEN no disparan flujos, por eso se dispara aquí,
+# con el evento "opened", y no con una etiqueta puesta por un robot.
+#
+# PALABRA CLAVE: un Issue nuevo del dueño cuyo título (o texto) empieza por "Agente"
+# también arranca solo, con nivel automático (sirve desde la app de GitHub).
+#
+# COMPILACIÓN (solo encargos normales o difíciles): Aider compila la app tras cada
+# cambio; si no compila, ve el error y lo corrige solo. En los fáciles va directo.
+#
+# CHAT: si el dueño comenta en el Issue o en el Pull Request del agente, Aider
+# contesta (si termina en "?" o empieza por "pregunta": solo responde, no toca
+# código) o continúa en la MISMA rama del PR (si es una orden).
+#
+# Seguridad: solo el dueño del repo (autor del Issue o del comentario); los
+# comentarios del robot nunca disparan nada.
+on:
+  issues:
+    types: [labeled, opened]
+  issue_comment:
+    types: [created]
+  push:
+    branches: [main]
+    paths: [".github/workflows/aider.yml", ".github/scripts/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write       # crear ramas y subir commits
+  pull-requests: write  # abrir el Pull Request
+  issues: write         # comentar en el Issue y crear la etiqueta
+  actions: write        # lanzar la compilación de la APK
+
+env:
+  # Modelos (IDs de https://openrouter.ai/api/v1/models). Para cambiar uno,
+  # edita solo su línea. Cada ejecución los comprueba contra la lista real.
+  MODELO: deepseek/deepseek-v4.1-flash          # barato: escribe código y hace de "barato"
+  MODELO_PRO_PIENSA: deepseek/deepseek-v4-pro   # aider-pro: el que piensa
+  MODELO_MAX_KIMI: moonshotai/kimi-k3           # aider-max: el que piensa (primera opción)
+  MODELO_MAX_GLM: z-ai/glm-5                    # aider-max: si no existe Kimi K3 (si tampoco, se usa el GLM más alto)
+
+jobs:
+  # Crea las etiquetas si no existen y valida TODOS los modelos
+  # (se ejecuta al subir este archivo o a mano).
+  preparar:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create aider-reintento --repo "$GITHUB_REPOSITORY" \
+            --color fbca04 --description "Repetir un encargo fallido con un modelo más fuerte" --force
+          gh label create aider --repo "$GITHUB_REPOSITORY" \
+            --color 7057ff --description "Encargo para el agente Aider" --force
+          gh label create aider-pro --repo "$GITHUB_REPOSITORY" \
+            --color 0e8a16 --description "Aider en modo arquitecto: piensa DeepSeek Pro" --force
+          gh label create aider-max --repo "$GITHUB_REPOSITORY" \
+            --color d93f0b --description "Aider en modo arquitecto: piensa Kimi/GLM" --force
+      - name: Validar todos los modelos contra OpenRouter
+        run: python3 .github/scripts/modelos.py listar
+
+  aider:
+    # Solo el dueño del repo, en los dos casos:
+    #  - etiqueta puesta a mano (labeled), o
+    #  - Issue nuevo hecho con el formulario (opened): se reconoce por llevar
+    #    el apartado "### Dificultad", así un Issue normal no arranca por error
+    #    ni se ejecuta dos veces.
+    if: >
+      github.event_name == 'issues' &&
+      github.event.sender.login == github.repository_owner && (
+        (github.event.action == 'labeled' &&
+          contains(fromJSON('["aider","aider-pro","aider-max","aider-reintento"]'), github.event.label.name)) ||
+        (github.event.action == 'opened' &&
+          github.event.issue.user.login == github.repository_owner &&
+          (contains(github.event.issue.body, '### Dificultad') ||
+           startsWith(github.event.issue.title, 'agente') ||
+           startsWith(github.event.issue.body, 'agente')))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: aider-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NUM: ${{ github.event.issue.number }}
+      TITULO: ${{ github.event.issue.title }}
+      CUERPO: ${{ github.event.issue.body }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decidir nivel (a mano, forzado en el formulario, o triaje automático)
+        env:
+          ACCION: ${{ github.event.action }}
+          ETIQUETA_PUESTA: ${{ github.event.label.name }}
+        run: |
+          nivel_de() {
+            case "$1" in aider) echo "fácil";; aider-pro) echo "normal";; aider-max) echo "difícil";; *) echo "reintento";; esac
+          }
+          TITULO_FINAL="$TITULO"
+          COSTE_TRIAJE='$0'
+          TRIAJE_MODELO=""
+          TRIAJE_TOK=""
+          if [ "$ACCION" = opened ]; then
+            if ! python3 .github/scripts/modelos.py leer > /tmp/formulario.env 2> /tmp/formulario.err; then
+              gh issue comment "$NUM" --body "❌ No entendí la dificultad del formulario: $(cat /tmp/formulario.err). Pon a mano una de las etiquetas \`aider\`, \`aider-pro\` o \`aider-max\`."
+              exit 1
+            fi
+            ETIQUETA=$(sed -n 's/^ETIQUETA=//p' /tmp/formulario.env)
+            RESUMEN=$(sed -n 's/^RESUMEN=//p' /tmp/formulario.env)
+            if [ "$ETIQUETA" = auto ]; then
+              # Triaje: un modelo barato lee el encargo y decide el nivel (nunca falla: si no puede, "normal").
+              TEXTO="$TITULO"$'\n\n'"$CUERPO" python3 .github/scripts/modelos.py triaje > /tmp/triaje.env
+              cat /tmp/triaje.env
+              ETIQUETA=$(sed -n 's/^ETIQUETA=//p' /tmp/triaje.env)
+              NIVEL=$(sed -n 's/^NIVEL=//p' /tmp/triaje.env)
+              RAZON=$(sed -n 's/^RAZON=//p' /tmp/triaje.env)
+              COSTE_TRIAJE=$(sed -n 's/^COSTE_TRIAJE=//p' /tmp/triaje.env)
+              TRIAJE_TOK=$(sed -n 's/^TRIAJE_TOK=//p' /tmp/triaje.env)
+              TRIAJE_MODELO="$MODELO"
+            else
+              NIVEL=$(nivel_de "$ETIQUETA")
+              RAZON="lo elegiste tú en el formulario"
+            fi
+            # Etiqueta puesta por el robot: no dispara nada (GITHUB_TOKEN), solo queda constancia.
+            gh issue edit "$NUM" --add-label "$ETIQUETA" || true
+            # Si dejaste el título por defecto (o empieza por "Agente"), se pone uno corto
+            # sacado de lo que dictaste. El texto completo sigue llegando a Aider.
+            if { [ "$TITULO" = "Encargo por voz" ] || [[ "${TITULO,,}" == agente* ]]; } && [ -n "$RESUMEN" ]; then
+              TITULO_FINAL="$RESUMEN"
+              gh issue edit "$NUM" --title "$RESUMEN" || true
+            fi
+          else
+            ETIQUETA="$ETIQUETA_PUESTA"
+            NIVEL=$(nivel_de "$ETIQUETA")
+            RAZON="pusiste la etiqueta a mano"
+          fi
+          {
+            echo "ETIQUETA=$ETIQUETA"
+            echo "NIVEL=$NIVEL"
+            echo "RAZON=$RAZON"
+            echo "COSTE_TRIAJE=$COSTE_TRIAJE"
+            echo "TRIAJE_MODELO=$TRIAJE_MODELO"
+            echo "TRIAJE_TOK=$TRIAJE_TOK"
+            echo "TITULO_FINAL=$TITULO_FINAL"
+          } >> "$GITHUB_ENV"
+
+      - name: Comprobar clave y modelos
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            gh issue comment "$NUM" --body "❌ Falta el secreto **OPENROUTER_API_KEY**. Guárdalo aquí: https://github.com/$GITHUB_REPOSITORY/settings/secrets/actions/new y vuelve a poner la etiqueta \`aider\`."
+            exit 1
+          fi
+          if ! python3 .github/scripts/modelos.py elegir "$ETIQUETA" > /tmp/modelos.env; then
+            gh issue comment "$NUM" --body "❌ Algún modelo de la etiqueta \`$ETIQUETA\` ya no existe en OpenRouter ($(cat /tmp/modelos_error.txt 2>/dev/null)). Hay que cambiar las líneas de modelos al principio de .github/workflows/aider.yml."
+            exit 1
+          fi
+          cat /tmp/modelos.env >> "$GITHUB_ENV"
+          set -a; source /tmp/modelos.env; set +a
+          if [ "$MODO" = simple ]; then
+            USADOS="\`$PIENSA\`"
+          else
+            USADOS="piensa \`$PIENSA\` · escribe \`$ESCRIBE\` · barato \`$BARATO\`"
+          fi
+          echo "USADOS=$USADOS" >> "$GITHUB_ENV"
+          if [ -n "$TRIAJE_MODELO" ]; then
+            HECHO="un modelo barato ha leído tu encargo y ha decidido el nivel «$NIVEL»; ahora empiezo a programar."
+          else
+            HECHO="empiezo a programar con el nivel «$NIVEL» ($RAZON)."
+          fi
+          bash .github/scripts/reunir_comentarios.sh "$NUM" > /tmp/comentarios.json 2>/dev/null || echo '[]' > /tmp/comentarios.json
+          PARTE=$(FASE=inicio HECHO="$HECHO" INCLUYE_TRIAJE=si COMENTARIOS=/tmp/comentarios.json ISSUE="$NUM" \
+            python3 .github/scripts/modelos.py parte) || PARTE="📋 **Parte**: no disponible"
+          printf '🤖 Aider ha empezado. 🧭 Nivel **%s** (%s) → etiqueta `%s`: %s. Tardará unos minutos. [Ver progreso](%s/%s/actions/runs/%s)\n\n%s\n' \
+            "$NIVEL" "$RAZON" "$ETIQUETA" "$USADOS" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$PARTE" > /tmp/inicio.md
+          gh issue comment "$NUM" --body-file /tmp/inicio.md
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Java y Gradle (los mismos que compilar.yml) para que Aider pueda compilar.
+      # Solo en encargos normales o difíciles: en los fáciles se ahorra ~1 minuto.
+      - uses: actions/setup-java@v4
+        if: env.ETIQUETA != 'aider'
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        if: env.ETIQUETA != 'aider'
+        with:
+          gradle-version: "8.9"
+
+      - name: Instalar Aider
+        run: pip install --quiet aider-chat
+
+      - name: Ejecutar Aider con el encargo del Issue
+        run: |
+          git config user.name "aider-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          RAMA="aider/issue-$NUM-$GITHUB_RUN_ID"
+          echo "RAMA=$RAMA" >> "$GITHUB_ENV"
+          git checkout -b "$RAMA"
+
+          printf '%s\n\n%s\n\nHaz solo los cambios necesarios en el código. Responde y comenta en español.\n' "$TITULO_FINAL" "$CUERPO" > /tmp/encargo.txt
+          # Si el título se acortó (encargo dictado con "Agente, ..."), que Aider vea el texto completo.
+          if [ "$TITULO" != "$TITULO_FINAL" ] && [ "$TITULO" != "Encargo por voz" ]; then
+            printf '\nEncargo completo: %s\n' "$TITULO" >> /tmp/encargo.txt
+          fi
+
+          # Formulario: que Aider respete lo que no se debe tocar y busque lo pedido.
+          if printf '%s' "$CUERPO" | grep -q '^### Qué NO hay que tocar'; then
+            printf '\nEl encargo viene de un formulario: cumple "Qué quiero" y "Cómo sabré que funciona", y no toques nada de "Qué NO hay que tocar". Ignora el apartado "Dificultad".\n' >> /tmp/encargo.txt
+          fi
+
+          # Reintento: se añaden SOLO tus comentarios del Issue (los del robot no)
+          # para que Aider sepa qué salió mal la vez anterior.
+          if [ "$ETIQUETA" = aider-reintento ]; then
+            COMENTARIOS=$(gh api "repos/$GITHUB_REPOSITORY/issues/$NUM/comments" --paginate \
+              -q ".[] | select(.user.login == \"$GITHUB_REPOSITORY_OWNER\") | .body" || true)
+            printf '\nUn intento anterior con un modelo más barato falló o no convenció. Hazlo con más cuidado.\n' >> /tmp/encargo.txt
+            if [ -n "$COMENTARIOS" ]; then
+              printf 'Comentarios del dueño sobre lo que hay que corregir:\n%s\n' "$COMENTARIOS" >> /tmp/encargo.txt
+            fi
+          fi
+
+          # Las protecciones de seguridad (sin comandos de terminal, sin URLs) viven
+          # en el script común .github/scripts/lanzar_aider.sh
+          bash .github/scripts/lanzar_aider.sh /tmp/encargo.txt
+
+          git log --oneline main..HEAD > /tmp/commits.txt || true
+          echo "--- Commits de Aider:"; cat /tmp/commits.txt
+
+      - name: Abrir Pull Request y compilar la APK
+        run: |
+          COSTE_TOTAL=$(python3 .github/scripts/modelos.py suma "$COSTE" "$COSTE_TRIAJE")
+          bash .github/scripts/reunir_comentarios.sh "$NUM" > /tmp/comentarios.json 2>/dev/null || echo '[]' > /tmp/comentarios.json
+          # Parte de 4 líneas (la marca de coste no repite el triaje: ya iba en el comentario de inicio).
+          parte() {
+            FASE=fin HECHO="$1" INCLUYE_TRIAJE=no LOG=/tmp/aider.log COMENTARIOS=/tmp/comentarios.json ISSUE="$NUM" \
+              python3 .github/scripts/modelos.py parte || echo "📋 **Parte**: no disponible"
+          }
+          if [ ! -s /tmp/commits.txt ]; then
+            printf '🤷 Aider (`%s`: %s) terminó sin cambiar nada. 🧭 Nivel **%s** (%s). Prueba a explicar el encargo con más detalle y vuelve a poner la etiqueta `aider`. [Registro](%s/%s/actions/runs/%s)\n\n%s\n' \
+              "$ETIQUETA" "$USADOS" "$NIVEL" "$RAZON" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" \
+              "$(parte "Aider ha terminado sin cambiar ningún archivo.")" > /tmp/final.md
+            gh issue comment "$NUM" --body-file /tmp/final.md
+            exit 0
+          fi
+          git push origin "$RAMA"
+
+          printf 'Cambios hechos por Aider (nivel %s, etiqueta %s: %s, coste aprox. %s) para el Issue #%s.\n\nCloses #%s\n\n### Commits\n```\n%s\n```\n\nAPK de prueba de esta rama (en unos minutos):\n%s/%s/releases/download/prueba/huecos-a56.apk\n' \
+            "$NIVEL" "$ETIQUETA" "$USADOS" "$COSTE_TOTAL" "$NUM" "$NUM" "$(cat /tmp/commits.txt)" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" > /tmp/pr.md
+
+          if URL=$(gh pr create --base main --head "$RAMA" --title "Aider: $TITULO_FINAL" --body-file /tmp/pr.md); then
+            MSG="✅ Pull Request listo: $URL"
+          else
+            URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$RAMA?expand=1"
+            MSG="⚠️ GitHub no dejó al robot abrir el Pull Request. Ábrelo tú con un toque: $URL (pulsa **Create pull request**). Para que no vuelva a pasar, activa *Allow GitHub Actions to create and approve pull requests* en $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/settings/actions"
+          fi
+
+          # Los cambios subidos por el robot no disparan otros workflows solos,
+          # así que lanzamos la compilación de la APK a mano sobre la rama.
+          gh workflow run compilar.yml --ref "$RAMA"
+
+          NCOMMITS=$(wc -l < /tmp/commits.txt | tr -d ' ')
+          printf '%s\n\n🧭 Nivel **%s** (%s) · 🏷️ etiqueta `%s` · %s\n\n%s\n%s\n\n📱 APK de prueba (lista en ~5 min): %s/%s/releases/download/prueba/huecos-a56.apk\nSi te gusta, entra en el Pull Request y pulsa **Merge pull request** → **Confirm merge**. Entonces se actualizará la APK principal.\n' \
+            "$MSG" "$NIVEL" "$RAZON" "$ETIQUETA" "$USADOS" "$(cat /tmp/compila.md 2>/dev/null)" \
+            "$(parte "he programado el encargo ($NCOMMITS commit/s) y abierto el Pull Request.")" \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" > /tmp/final.md
+          gh issue comment "$NUM" --body-file /tmp/final.md
+
+      # Para poder repetir con la misma etiqueta, el robot la quita al terminar
+      # (quitarla con GITHUB_TOKEN no dispara ningún flujo).
+      - name: Quitar la etiqueta de reintento
+        if: always()
+        run: |
+          if [ "$ETIQUETA" = aider-reintento ]; then
+            gh issue edit "$NUM" --remove-label aider-reintento || true
+          fi
+
+  # CHAT: el dueño comenta en el Issue o en el Pull Request del agente.
+  chat:
+    # Solo comentarios del DUEÑO (nunca del robot: así no hay bucles).
+    if: >
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.event.sender.login == github.repository_owner &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.user.type == 'User' &&
+      github.event.comment.author_association == 'OWNER'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: aider-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NUM: ${{ github.event.issue.number }}
+      TITULO: ${{ github.event.issue.title }}
+      CUERPO: ${{ github.event.issue.body }}
+      COMENTARIO: ${{ github.event.comment.body }}
+      COMENTARIO_ID: ${{ github.event.comment.id }}
+      ES_PR: ${{ github.event.issue.pull_request && 'si' || 'no' }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Los scripts se usan SIEMPRE desde esta copia de main: la rama del PR puede ser
+      # más antigua (sin los scripts nuevos) y, además, así nunca se ejecuta código
+      # que venga de una rama.
+      - name: Guardar los scripts de main
+        run: cp -r .github/scripts /tmp/scripts
+
+      # Averigua sobre qué rama hay que trabajar. Solo vale un PR de ESTE repo cuya
+      # rama empiece por "aider/" (los que crea el agente); lo demás se ignora.
+      - name: Localizar la rama del agente
+        id: loc
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/comments/$COMENTARIO_ID/reactions" -f content=eyes > /dev/null || true
+          saltar() { echo "saltar=si" >> "$GITHUB_OUTPUT"; exit 0; }
+          responder() { gh issue comment "$NUM" --body "$1"; saltar; }
+
+          if [ "$ES_PR" = si ]; then
+            JSON=$(gh pr view "$NUM" --json number,headRefName,isCrossRepository,state)
+          else
+            JSON=$(gh pr list --state all --limit 100 --json number,headRefName,isCrossRepository,state \
+              | jq -c --arg p "aider/issue-$NUM-" '[.[] | select((.headRefName | startswith($p)) and (.isCrossRepository | not))] | sort_by(.number) | last // empty')
+          fi
+
+          if [ -z "$JSON" ]; then
+            if gh issue view "$NUM" --json labels -q '.labels[].name' | grep -q '^aider'; then
+              responder "🤷 Este encargo todavía no tiene Pull Request, así que no tengo rama donde trabajar. Si el primer intento falló, pon la etiqueta \`aider-reintento\`."
+            fi
+            saltar
+          fi
+
+          RAMA=$(jq -r .headRefName <<< "$JSON")
+          CRUZADO=$(jq -r .isCrossRepository <<< "$JSON")
+          ESTADO=$(jq -r .state <<< "$JSON")
+          PR=$(jq -r .number <<< "$JSON")
+          case "$RAMA" in aider/*) ;; *) saltar ;; esac
+          [ "$CRUZADO" = true ] && saltar
+          if [ "$ESTADO" != OPEN ]; then
+            responder "🔒 El Pull Request #$PR ya está cerrado o fusionado ($ESTADO), así que no puedo seguir en él. Para algo nuevo, crea otro encargo: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/issues/new?template=encargo.yml"
+          fi
+          {
+            echo "saltar=no"
+            echo "rama=$RAMA"
+            echo "pr=$PR"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        if: steps.loc.outputs.saltar != 'si'
+        with:
+          python-version: "3.12"
+
+      - name: Entender el comentario (pregunta u orden) y elegir modelo
+        if: steps.loc.outputs.saltar != 'si'
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            gh issue comment "$NUM" --body "❌ Falta el secreto **OPENROUTER_API_KEY**. Guárdalo aquí: https://github.com/$GITHUB_REPOSITORY/settings/secrets/actions/new"
+            exit 1
+          fi
+          # Pregunta = termina en "?" o empieza por "pregunta". Todo lo demás es una orden.
+          TXT=$(python3 /tmp/scripts/modelos.py limpiar)
+          printf '%s' "$TXT" > /tmp/comentario.txt
+          MIN="${TXT,,}"
+          COSTE_TRIAJE='$0'
+          TRIAJE_MODELO=""
+          TRIAJE_TOK=""
+          if [[ "$TXT" == *\? || "$MIN" == pregunta* ]]; then
+            TIPO=pregunta
+            ETIQUETA=aider
+            NIVEL="fácil"
+            RAZON="las preguntas las contesta el modelo barato, sin tocar código"
+          else
+            TIPO=orden
+            # Triaje de la orden con el modelo barato (nunca falla: si no puede, "normal").
+            TEXTO="$TITULO"$'\n\n'"Orden nueva sobre un trabajo ya hecho: $TXT" python3 /tmp/scripts/modelos.py triaje > /tmp/triaje.env
+            cat /tmp/triaje.env
+            ETIQUETA=$(sed -n 's/^ETIQUETA=//p' /tmp/triaje.env)
+            NIVEL=$(sed -n 's/^NIVEL=//p' /tmp/triaje.env)
+            RAZON=$(sed -n 's/^RAZON=//p' /tmp/triaje.env)
+            COSTE_TRIAJE=$(sed -n 's/^COSTE_TRIAJE=//p' /tmp/triaje.env)
+            TRIAJE_TOK=$(sed -n 's/^TRIAJE_TOK=//p' /tmp/triaje.env)
+            TRIAJE_MODELO="$MODELO"
+          fi
+          if ! python3 /tmp/scripts/modelos.py elegir "$ETIQUETA" > /tmp/modelos.env; then
+            gh issue comment "$NUM" --body "❌ Algún modelo de la etiqueta \`$ETIQUETA\` ya no existe en OpenRouter ($(cat /tmp/modelos_error.txt 2>/dev/null)). Hay que cambiar las líneas de modelos al principio de .github/workflows/aider.yml."
+            exit 1
+          fi
+          cat /tmp/modelos.env >> "$GITHUB_ENV"
+          source /tmp/modelos.env
+          if [ "$MODO" = simple ]; then
+            USADOS="\`$PIENSA\`"
+          else
+            USADOS="piensa \`$PIENSA\` · escribe \`$ESCRIBE\` · barato \`$BARATO\`"
+          fi
+          {
+            echo "TIPO=$TIPO"
+            echo "ETIQUETA=$ETIQUETA"
+            echo "NIVEL=$NIVEL"
+            echo "RAZON=$RAZON"
+            echo "COSTE_TRIAJE=$COSTE_TRIAJE"
+            echo "TRIAJE_MODELO=$TRIAJE_MODELO"
+            echo "TRIAJE_TOK=$TRIAJE_TOK"
+            echo "USADOS=$USADOS"
+          } >> "$GITHUB_ENV"
+
+      # Java y Gradle (los mismos que compilar.yml) para que Aider pueda compilar.
+      # Solo para órdenes normales o difíciles: en las fáciles y en preguntas no hace falta.
+      - uses: actions/setup-java@v4
+        if: steps.loc.outputs.saltar != 'si' && env.ETIQUETA != 'aider'
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.loc.outputs.saltar != 'si' && env.ETIQUETA != 'aider'
+        with:
+          gradle-version: "8.9"
+
+      - name: Instalar Aider
+        if: steps.loc.outputs.saltar != 'si'
+        run: pip install --quiet aider-chat
+
+      - name: Ejecutar Aider sobre la rama del PR
+        if: steps.loc.outputs.saltar != 'si'
+        env:
+          RAMA: ${{ steps.loc.outputs.rama }}
+          PR: ${{ steps.loc.outputs.pr }}
+        run: |
+          git config user.name "aider-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # MISMA rama del PR: los commits nuevos se suman a ese Pull Request.
+          git checkout -B "$RAMA" "origin/$RAMA"
+
+          {
+            printf 'Trabajas en el Pull Request #%s (rama %s).\n\nEncargo original: %s\n%s\n\n' "$PR" "$RAMA" "$TITULO" "$CUERPO"
+            printf 'Commits ya hechos en este PR:\n%s\n\nArchivos cambiados en este PR:\n%s\n\n' \
+              "$(git log --oneline origin/main..HEAD)" "$(git diff --stat origin/main...HEAD)"
+            printf 'Conversación reciente (más antiguo primero):\n'
+            gh api "repos/$GITHUB_REPOSITORY/issues/$NUM/comments" --paginate \
+              | jq -s -r --arg id "$COMENTARIO_ID" '[.[][]] | map(select((.id | tostring) != $id)) | .[-6:] | .[] | "- " + .user.login + ": " + (.body[0:1200])' || true
+            printf '\nMENSAJE NUEVO DEL DUEÑO:\n%s\n\n' "$(cat /tmp/comentario.txt)"
+            if [ "$TIPO" = pregunta ]; then
+              printf 'Es una PREGUNTA: respóndela en español sencillo. NO cambies ningún archivo.\n'
+            else
+              printf 'Es una ORDEN: haz solo los cambios necesarios para cumplirla, sin tocar nada más. Responde y comenta en español.\n'
+            fi
+          } > /tmp/encargo.txt
+
+          if [ "$TIPO" = pregunta ]; then export ASK=1; fi
+          # Las protecciones de seguridad (sin comandos de terminal, sin URLs) viven
+          # en el script común /tmp/scripts/lanzar_aider.sh
+          bash /tmp/scripts/lanzar_aider.sh /tmp/encargo.txt /tmp/aider.chat.history.md
+
+      - name: Contestar en el Issue / Pull Request
+        if: steps.loc.outputs.saltar != 'si'
+        env:
+          RAMA: ${{ steps.loc.outputs.rama }}
+          PR: ${{ steps.loc.outputs.pr }}
+        run: |
+          # Issue al que pertenece la rama (aider/issue-N-...) para sumar el coste acumulado.
+          ISSUE_N="${RAMA#aider/issue-}"; ISSUE_N="${ISSUE_N%%-*}"
+          bash /tmp/scripts/reunir_comentarios.sh "$ISSUE_N" > /tmp/comentarios.json 2>/dev/null || echo '[]' > /tmp/comentarios.json
+          # Parte de 4 líneas. Aquí no hubo comentario de inicio, así que la marca incluye el triaje.
+          parte() {
+            FASE=fin HECHO="$1" INCLUYE_TRIAJE=si LOG=/tmp/aider.log COMENTARIOS=/tmp/comentarios.json ISSUE="$ISSUE_N" \
+              python3 /tmp/scripts/modelos.py parte || echo "📋 **Parte**: no disponible"
+          }
+          RESP=$(python3 /tmp/scripts/modelos.py respuesta /tmp/aider.chat.history.md 2>/dev/null || true)
+          if [ -z "$RESP" ]; then
+            RESP="(No pude separar la respuesta; este es el final del registro)
+          \`\`\`
+          $(tail -n 30 /tmp/aider.log)
+          \`\`\`"
+          fi
+
+          if [ "$TIPO" = pregunta ]; then
+            # Comprobación real: una pregunta no debe dejar commits nuevos.
+            if [ -z "$(git log --oneline "origin/$RAMA..HEAD")" ]; then
+              HECHO="he respondido tu pregunta sin tocar ningún archivo."
+            else
+              HECHO="he respondido tu pregunta, pero Aider hizo cambios en local que NO he subido."
+            fi
+            printf '💬 %s\n\n🧭 Nivel **%s** (%s)\n%s\n' "$RESP" "$NIVEL" "$RAZON" \
+              "$(parte "$HECHO")" > /tmp/respuesta.md
+            gh issue comment "$NUM" --body-file /tmp/respuesta.md
+            exit 0
+          fi
+
+          NUEVOS=$(git log --oneline "origin/$RAMA..HEAD")
+          if [ -z "$NUEVOS" ]; then
+            printf '🤷 No he cambiado nada en el Pull Request #%s. Esto es lo que ha dicho Aider:\n\n%s\n\n🧭 Nivel **%s** (%s)\n%s\n\nSi no era lo que querías, explícalo con más detalle en otro comentario.\n' \
+              "$PR" "$RESP" "$NIVEL" "$RAZON" "$(parte "Aider ha terminado sin cambiar ningún archivo.")" > /tmp/respuesta.md
+            gh issue comment "$NUM" --body-file /tmp/respuesta.md
+            exit 0
+          fi
+
+          NCOMMITS=$(printf '%s\n' "$NUEVOS" | wc -l | tr -d ' ')
+          CAMBIOS=$(git diff --stat "origin/$RAMA..HEAD")
+          git push origin "$RAMA"
+          # Los cambios subidos por el robot no disparan otros flujos solos:
+          # lanzamos la compilación de la APK a mano sobre la rama.
+          gh workflow run compilar.yml --ref "$RAMA"
+          printf '✅ Hecho. He subido esto a la misma rama del Pull Request #%s:\n\n```\n%s\n```\nArchivos tocados:\n```\n%s\n```\n%s\n🧭 Nivel **%s** (%s)\n%s\n\n📱 APK de prueba (lista en ~5 min): %s/%s/releases/download/prueba/huecos-a56.apk\n' \
+            "$PR" "$NUEVOS" "$CAMBIOS" "$(cat /tmp/compila.md 2>/dev/null)" "$NIVEL" "$RAZON" \
+            "$(parte "he hecho el cambio que pediste y lo he subido a la misma rama del PR #$PR ($NCOMMITS commit/s nuevo/s).")" \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" > /tmp/respuesta.md
+          gh issue comment "$NUM" --body-file /tmp/respuesta.md
